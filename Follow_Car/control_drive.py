@@ -1,53 +1,83 @@
-# import necessary packages
 import time
 import RPi.GPIO as GPIO
 from motor import *
 from servo import *
 from rpi_ws281x import *
 import traceback
+from picamera2 import Picamera2
 
-def test():
-    driver = Drive()
-    infrared = Line_Tracking()
-    x = 1
-    try:
-        while True:
-            infrared.relativePos(x, driver)
-
-            # if an exception occurs stop the car
-    except Exception:
-        PWM = Ordinary_Car()
-        PWM.set_motor_model(0,0,0,0)
-        traceback.print_exc()
-    except KeyboardInterrupt:
-        PWM = Ordinary_Car()
-        PWM.set_motor_model(0,0,0,0)
-        traceback.print_exc()
-
-    return
-
-def drive():
+def drive(frame_queue, position_queue, exit_flag):
     # setup necessary control objects
+    servo = Servo()
+    cam = Picamera2()
     ultra = Ultrasonic()
     infrared=Line_Tracking()
     driver = Drive()
+    
+    last_position = (90,90) # the first position is at neutral
+
+    servo.set_servo_pwm('1', 90) # ensure servos are at neutral
+    servo.set_servo_pwm('0', 90)
+    cam.start() # start camera feed
+    time.sleep(4) # leave time for cross communication
+
+    x = 1.5
 
     try:
         while True:
-            x = ultra.collisionDetect() # detect and adjust speeds
-            driver.straight(x) # drive
+            if not exit_flag.empty(): # if the parent process ended end this process
+                raise Exception("Forced termination by parent process")
+            infrared.relativePos(x,driver) # drive
+            if not position_queue.empty(): # if new servo instructions were received adjust servo position
+                last_position = adjustServo(servo,cam, position_queue, last_position, frame_queue)
+            infrared.relativePos(x,driver) # drive
+            x = ultra.collisionDetect(x, driver, infrared) # run ACC component
 
-    # if an exception occurs stop the car
+            infrared.relativePos(x,driver) # drive
+            print("Again")
+
+    # end safely
     except Exception:
-        PWM = Ordinary_Car()
-        PWM.set_motor_model(0,0,0,0)
-        traceback.print_exc()
+        pass
     except KeyboardInterrupt:
+        pass
+    finally:
         PWM = Ordinary_Car()
-        PWM.set_motor_model(0,0,0,0)
-        traceback.print_exc()
+        PWM.set_motor_model(0,0,0,0) # shutoff motors
+        traceback.print_exc() # explain error
+        cam.close() # shutoff camera stream
+        servo.set_servo_pwm('1', 90) # reset servos to neutral
+        servo.set_servo_pwm('0', 90)
 
-class Ultrasonic: # class that manages the ultrasonic sensor, most code from Freenove repository except collisionDetect
+def adjustServo(servo, cam, position_queue, last_position, frame_queue):
+
+    new_x_position, new_y_position = position_queue.get() # get new servo instructions from the other process
+    current_x_position, current_y_position = last_position # remember current position
+
+    frame = cam.capture_array() # get a new frame
+    frame_queue.put(frame) # pass it to the other process
+
+    # adjust the position of the servo smoothly in horizontal plane
+    while abs(new_x_position - current_x_position) > 2:
+        if new_x_position > current_x_position:
+            current_x_position += 2
+        else:
+            current_x_position -= 2
+        servo.set_servo_pwm('0', current_x_position)
+        time.sleep(0.01)  # Small delay between steps
+
+    # adjust the position of the servo smoothly in vertical plane
+    while abs(new_y_position - current_y_position) > 2:
+        if new_y_position > current_y_position:
+            current_y_position += 2
+        else:
+            current_y_position -= 2
+        servo.set_servo_pwm('1', current_y_position)
+        time.sleep(0.01)  # Small delay between steps
+
+    return (new_x_position, new_y_position) # save current servo position
+
+class Ultrasonic: # class that manages the ultrasonic sensor
     def __init__(self): # initialize ultrasonic sensor object 
         self.x = 2       
         GPIO.setwarnings(False)        
@@ -82,7 +112,7 @@ class Ultrasonic: # class that manages the ultrasonic sensor, most code from Fre
         distance_cm=sorted(distance_cm)
         return  int(distance_cm[2])
     
-    def collisionDetect(self): # function defined by us and not from Freenove repository
+    def collisionDetect(self,xOld, driver, infrared):
         threshold = 30  # Distance below which the car must stop
         max_distance_for_adjustment = 150  # Distance below which we adjust x based on relative speed
         count = 0
@@ -91,32 +121,32 @@ class Ultrasonic: # class that manages the ultrasonic sensor, most code from Fre
         distance1 = self.get_distance()
         while distance1 == 0:
             distance1 = self.get_distance()
-
+        infrared.relativePos(xOld,driver) # added frequently to try to update motors regularly enough
         time.sleep(0.1)  # Wait before next reading
-
+        infrared.relativePos(xOld,driver)
         # Get a valid second distance reading
         distance2 = self.get_distance()
         while distance2 == 0:
             distance2 = self.get_distance()
-
+        infrared.relativePos(xOld,driver)
         # Calculate closure rate (relative speed)
         closure = (distance1 - distance2) / 0.1  
 
         # Time to collision
         TTC = float('inf') if closure <= 0 else distance2 / closure
 
-        # Adaptive Speed Adjustment
+        # Adaptive Speed Adjustment 
         if distance2 < max_distance_for_adjustment:
             if closure > 0:  # Getting closer
                 self.x = max(1, self.x - 0.2)
-            elif closure < 0:  # Moving away
+            elif closure < 0 and self.x != 0:  # Moving away
                 self.x = min(2, self.x + 0.2)
-
-        # Emergency Stop with low TTC
+        infrared.relativePos(xOld,driver)
+        # Emergency Stop
         if TTC < 0.4:
             self.x = 0
 
-        # emergency stop with low clearance
+        # Obstacle proximity-based stop 
         if distance2 < threshold:
             while True:
                 distance3 = self.get_distance()
@@ -124,6 +154,7 @@ class Ultrasonic: # class that manages the ultrasonic sensor, most code from Fre
                     count += 1
                     if count > 3:  # Ensure the reading is consistent
                         self.x = 0
+                        infrared.relativePos(0,driver)
                         break
                 else:
                     count = 0
@@ -132,14 +163,14 @@ class Ultrasonic: # class that manages the ultrasonic sensor, most code from Fre
             # If previously stopped and now distance is safe again
             if self.x == 0:
                 self.x = 1
-
+        infrared.relativePos(self.x,driver)
         # Debug prints
         print("Distance2:", distance2)
         print("Closure rate:", closure)
         print("TTC:", TTC)
         print("Throttle x:", self.x)
-
-        return self.x # return speed multiplier
+        infrared.relativePos(self.x,driver)
+        return self.x
 
     
 ######################################################################################################
@@ -153,6 +184,7 @@ class Line_Tracking: # class for managing the line tracking, servo, and general 
         GPIO.setup(self.IR02,GPIO.IN)
         GPIO.setup(self.IR03,GPIO.IN)
         self.LMR = 0
+
 
     def relativePos(self, x, drive):
                     # determine line position
@@ -199,33 +231,28 @@ class Line_Tracking: # class for managing the line tracking, servo, and general 
         
         
 ######################################################################################################
-class Drive: # class with numerous driving controls
-    def __init__(self):
+
+class Drive:
+    def __init__(self): # define control object
         self.PWM = Ordinary_Car()
         return
     
-    def stop(self):
-        self.PWM.set_motor_model(0,0,0,0)
-
     def straight(self, x): # drive straight
         v = int(800 * x)
         self.PWM.set_motor_model(v,v,v,v)
 
     def turnR(self, x): # turn slight right
-        v1 = int(1500*x)
-        v2 = int(-1000*x)
+        v1 = int(2500*x)
+        v2 = int(-1500*x)
         self.PWM.set_motor_model(v1,v1,v2,v2)
+        time.sleep(1)
+        self.PWM.set_motor_model(0,0,0,0)
 
     def turnL(self,x): # turn slight left
-        v1 = int(1500*x)
-        v2 = int(-1000*x)
+        v1 = int(2500*x)
+        v2 = int(-1500*x)
         self.PWM.set_motor_model(v2,v2,v1,v1)
-
+        time.sleep(1)
+        self.PWM.set_motor_model(0,0,0,0)
 ######################################################################################################  
-
-ultra=Ultrasonic()
-# Main program logic follows:
-if __name__ == '__main__':
-    print ('Program is starting ... ')
-    test()
 

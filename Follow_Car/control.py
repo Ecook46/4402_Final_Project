@@ -1,10 +1,12 @@
 import time
+from datetime import datetime
 import RPi.GPIO as GPIO
 from motor import *
 from servo import *
 from rpi_ws281x import *
 import traceback
 from picamera2 import Picamera2
+import pandas as pd
 
 def drive(frame_queue, position_queue, exit_flag):
     # setup necessary control objects
@@ -13,6 +15,8 @@ def drive(frame_queue, position_queue, exit_flag):
     ultra = Ultrasonic()
     infrared=Line_Tracking()
     driver = Drive()
+
+    datalog =pd.DataFrame(columns=['time', 'distance', 'closure', 'TTC', "x"])
     
     last_position = (90,90) # the first position is at neutral
 
@@ -29,7 +33,7 @@ def drive(frame_queue, position_queue, exit_flag):
             if not position_queue.empty(): # if new servo instructions were received adjust servo position
                 last_position = adjustServo(servo,cam, position_queue, last_position, frame_queue)
 
-            x = ultra.collisionDetect() # run ACC component
+            x = ultra.collisionDetect(datalog) # run ACC component
 
             driver.straight(x) # drive
 
@@ -45,6 +49,7 @@ def drive(frame_queue, position_queue, exit_flag):
         cam.close() # shutoff camera stream
         servo.set_servo_pwm('1', 90) # reset servos to neutral
         servo.set_servo_pwm('0', 90)
+        datalog.to_csv("loggedData.csv") # for saving data
 
 def adjustServo(servo, cam, position_queue, last_position, frame_queue):
 
@@ -109,9 +114,9 @@ class Ultrasonic: # class that manages the ultrasonic sensor
         distance_cm=sorted(distance_cm)
         return  int(distance_cm[2])
     
-    def collisionDetect(self):
+    def collisionDetect(self, datalog):
         threshold = 30  # Distance below which the car must stop
-        max_distance_for_adjustment = 150  # Distance below which we adjust x based on relative speed
+        max_distance_for_adjustment = 75  # Distance below which we adjust x based on relative speed
         count = 0
 
         # Get a valid first distance reading (filtering out false zeros)
@@ -133,12 +138,13 @@ class Ultrasonic: # class that manages the ultrasonic sensor
         TTC = float('inf') if closure <= 0 else distance2 / closure
 
         # Adaptive Speed Adjustment 
-        if distance2 < max_distance_for_adjustment:
-            if closure > 0:  # Getting closer
+        if distance2 < max_distance_for_adjustment and distance2 > 10:
+            if closure > 0:  # Getting closer slow down
                 self.x = max(1, self.x - 0.2)
-            elif closure < 0 and self.x != 0:  # Moving away
-                self.x = min(2, self.x + 0.2)
-
+            elif closure < 0 and self.x != 0:  # Moving away allow speed up
+                self.x = min(2, max(self.x + 0.2,1))
+        if distance2 > max_distance_for_adjustment: # allow for speeding up in clear road
+            self.x = min(2, max(self.x + 0.2,1))
         # Emergency Stop
         if TTC < 0.4:
             self.x = 0
@@ -165,6 +171,8 @@ class Ultrasonic: # class that manages the ultrasonic sensor
         print("Closure rate:", closure)
         print("TTC:", TTC)
         print("Throttle x:", self.x)
+
+        datalog.loc[len(datalog)] = [datetime.now(), distance2, closure, TTC, self.x] # log data
 
         return self.x
 
